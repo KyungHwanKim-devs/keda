@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -52,7 +54,21 @@ type ScaledObject struct {
 }
 
 const ScaledObjectOwnerAnnotation = "scaledobject.keda.sh/name"
+const ScaledObjectOwnerHashAnnotation = "scaledobject.keda.sh/name-hash"
 const ScaledObjectTransferHpaOwnershipAnnotation = "scaledobject.keda.sh/transfer-hpa-ownership"
+
+// ScaledObjectNameHashLength is the length of the hash used for the name-hash label.
+// Using 32 hex characters (128 bits) which is well under the 63 char label value limit.
+const ScaledObjectNameHashLength = 32
+
+// GenerateScaledObjectNameHash generates a deterministic hash from namespace and name.
+// The hash is always ScaledObjectNameHashLength characters, ensuring it fits within
+// Kubernetes' 63-character label value limit.
+func GenerateScaledObjectNameHash(namespace, name string) string {
+	input := namespace + "/" + name
+	hash := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(hash[:])[:ScaledObjectNameHashLength]
+}
 const ScaledObjectExcludedLabelsAnnotation = "scaledobject.keda.sh/hpa-excluded-labels"
 const ValidationsHpaOwnershipAnnotation = "validations.keda.sh/hpa-ownership"
 const PausedReplicasAnnotation = "autoscaling.keda.sh/paused-replicas"

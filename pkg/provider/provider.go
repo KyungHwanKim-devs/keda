@@ -95,17 +95,49 @@ func (p *KedaProvider) GetExternalMetric(ctx context.Context, namespace string, 
 		logger.Info("Connection to KEDA Metrics Service gRPC server has been successfully established", "server", p.grpcClient.GetServerURL())
 	}
 
-	// selector is in form: `scaledobject.keda.sh/name: scaledobject-name`
+	// Try to get ScaledObject name directly from the name label (backward compatible).
+	// If name label is not present (e.g., name > 63 chars), fall back to resolving via name-hash label.
+	// See: https://github.com/kedacore/keda/issues/6998
 	scaledObjectName := selector.Get(kedav1alpha1.ScaledObjectOwnerAnnotation)
 	if scaledObjectName == "" {
-		err := fmt.Errorf("scaledObject name is not specified")
-		logger.Error(err, fmt.Sprintf("please specify scaledObject name, it needs to be set as value of label selector %q on the query", kedav1alpha1.ScaledObjectOwnerAnnotation))
+		// Name label not present, try to resolve from hash
+		nameHash := selector.Get(kedav1alpha1.ScaledObjectOwnerHashAnnotation)
+		if nameHash == "" {
+			err := fmt.Errorf("scaledObject identifier is not specified")
+			logger.Error(err, fmt.Sprintf("please specify scaledObject name (%q) or name-hash (%q) as label selector on the query",
+				kedav1alpha1.ScaledObjectOwnerAnnotation, kedav1alpha1.ScaledObjectOwnerHashAnnotation))
+			return &external_metrics.ExternalMetricValueList{}, err
+		}
 
-		return &external_metrics.ExternalMetricValueList{}, err
+		// Resolve ScaledObject name from hash
+		resolvedName, err := p.resolveScaledObjectNameFromHash(ctx, namespace, nameHash)
+		if err != nil {
+			logger.Error(err, "failed to resolve ScaledObject name from hash", "hash", nameHash, "namespace", namespace)
+			return &external_metrics.ExternalMetricValueList{}, err
+		}
+		scaledObjectName = resolvedName
+		logger.V(1).Info("Resolved ScaledObject name from hash", "hash", nameHash, "name", scaledObjectName)
 	}
 
 	metrics, err := p.grpcClient.GetMetrics(ctx, scaledObjectName, namespace, info.Metric)
 	logger.V(1).WithValues("scaledObjectName", scaledObjectName, "scaledObjectNamespace", namespace, "metrics", metrics).Info("Receiving metrics")
 
 	return metrics, err
+}
+
+// resolveScaledObjectNameFromHash resolves a ScaledObject name from its name-hash label.
+// This is used when the ScaledObject name exceeds 63 characters and cannot be used directly as a label value.
+func (p *KedaProvider) resolveScaledObjectNameFromHash(ctx context.Context, namespace, hash string) (string, error) {
+	soList := &kedav1alpha1.ScaledObjectList{}
+	if err := p.client.List(ctx, soList, client.InNamespace(namespace)); err != nil {
+		return "", fmt.Errorf("failed to list ScaledObjects: %w", err)
+	}
+
+	for _, so := range soList.Items {
+		if kedav1alpha1.GenerateScaledObjectNameHash(so.Namespace, so.Name) == hash {
+			return so.Name, nil
+		}
+	}
+
+	return "", fmt.Errorf("ScaledObject with name-hash %q not found in namespace %q", hash, namespace)
 }
