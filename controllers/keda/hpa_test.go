@@ -119,12 +119,94 @@ var _ = Describe("hpa", func() {
 		Expect(capturedScaledObject.Status.Health).To(Equal(expectedHealth))
 	})
 
+	It("should use UID label instead of name label for external metrics", func() {
+		health := make(map[string]v1alpha1.HealthStatus)
+		scaledObject := setupTest(health, scaler, scaleHandler)
+
+		var capturedScaledObject v1alpha1.ScaledObject
+		client.EXPECT().Status().Return(statusWriter)
+		statusWriter.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(arg interface{}, scaledObject *v1alpha1.ScaledObject, anotherArg interface{}, opts ...interface{}) {
+			capturedScaledObject = *scaledObject
+		})
+
+		metricSpecs, err := reconciler.getScaledObjectMetricSpecs(context.Background(), logger, scaledObject)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(metricSpecs).To(HaveLen(1))
+		Expect(metricSpecs[0].External).ToNot(BeNil())
+		Expect(metricSpecs[0].External.Metric.Selector).ToNot(BeNil())
+		// Verify that UID label is used instead of name label
+		Expect(metricSpecs[0].External.Metric.Selector.MatchLabels).To(HaveKey(v1alpha1.ScaledObjectOwnerUIDAnnotation))
+		Expect(metricSpecs[0].External.Metric.Selector.MatchLabels[v1alpha1.ScaledObjectOwnerUIDAnnotation]).To(Equal(string(capturedScaledObject.UID)))
+		// Verify that name label is NOT used
+		Expect(metricSpecs[0].External.Metric.Selector.MatchLabels).ToNot(HaveKey(v1alpha1.ScaledObjectOwnerAnnotation))
+	})
+
+	It("should handle ScaledObject with name longer than 63 characters", func() {
+		health := make(map[string]v1alpha1.HealthStatus)
+		scaledObject := setupTestWithLongName(health, scaler, scaleHandler)
+
+		var capturedScaledObject v1alpha1.ScaledObject
+		client.EXPECT().Status().Return(statusWriter)
+		statusWriter.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any()).Do(func(arg interface{}, scaledObject *v1alpha1.ScaledObject, anotherArg interface{}, opts ...interface{}) {
+			capturedScaledObject = *scaledObject
+		})
+
+		metricSpecs, err := reconciler.getScaledObjectMetricSpecs(context.Background(), logger, scaledObject)
+
+		Expect(err).ToNot(HaveOccurred())
+		Expect(metricSpecs).To(HaveLen(1))
+		Expect(metricSpecs[0].External).ToNot(BeNil())
+		// UID is always <= 36 characters, so it should be valid as label value
+		uidLabelValue := metricSpecs[0].External.Metric.Selector.MatchLabels[v1alpha1.ScaledObjectOwnerUIDAnnotation]
+		Expect(len(uidLabelValue)).To(BeNumerically("<=", 63))
+		Expect(uidLabelValue).To(Equal(string(capturedScaledObject.UID)))
+	})
+
 })
 
 func setupTest(health map[string]v1alpha1.HealthStatus, scaler *mock_scalers.MockScaler, scaleHandler *mock_scaling.MockScaleHandler) *v1alpha1.ScaledObject {
 	scaledObject := &v1alpha1.ScaledObject{
 		ObjectMeta: v1.ObjectMeta{
 			Name: "some scaled object name",
+			UID:  "test-uid-12345",
+		},
+		Status: v1alpha1.ScaledObjectStatus{
+			Health: health,
+		},
+	}
+
+	scalersCache := cache.ScalersCache{
+		Scalers: []cache.ScalerBuilder{{
+			Scaler: scaler,
+			Factory: func() (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
+				return scaler, &scalersconfig.ScalerConfig{}, nil
+			},
+		}},
+		Recorder: nil,
+	}
+	metricSpec := v2.MetricSpec{
+		External: &v2.ExternalMetricSource{
+			Metric: v2.MetricIdentifier{
+				Name: "some metric name",
+			},
+		},
+	}
+	metricSpecs := []v2.MetricSpec{metricSpec}
+	ctx := context.Background()
+	scaler.EXPECT().GetMetricSpecForScaling(ctx).Return(metricSpecs)
+	scaleHandler.EXPECT().GetScalersCache(context.Background(), gomock.Eq(scaledObject)).Return(&scalersCache, nil)
+
+	return scaledObject
+}
+
+func setupTestWithLongName(health map[string]v1alpha1.HealthStatus, scaler *mock_scalers.MockScaler, scaleHandler *mock_scaling.MockScaleHandler) *v1alpha1.ScaledObject {
+	// Create a name longer than 63 characters to test the fix for issue #6998
+	longName := "this-is-a-very-long-scaled-object-name-that-exceeds-63-characters-limit-test"
+	scaledObject := &v1alpha1.ScaledObject{
+		ObjectMeta: v1.ObjectMeta{
+			Name: longName,
+			UID:  "uid-for-long-name-so",
 		},
 		Status: v1alpha1.ScaledObjectStatus{
 			Health: health,

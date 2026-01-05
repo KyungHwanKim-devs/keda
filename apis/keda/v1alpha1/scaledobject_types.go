@@ -52,6 +52,7 @@ type ScaledObject struct {
 }
 
 const ScaledObjectOwnerAnnotation = "scaledobject.keda.sh/name"
+const ScaledObjectOwnerUIDAnnotation = "scaledobject.keda.sh/uid"
 const ScaledObjectTransferHpaOwnershipAnnotation = "scaledobject.keda.sh/transfer-hpa-ownership"
 const ScaledObjectExcludedLabelsAnnotation = "scaledobject.keda.sh/hpa-excluded-labels"
 const ValidationsHpaOwnershipAnnotation = "validations.keda.sh/hpa-ownership"

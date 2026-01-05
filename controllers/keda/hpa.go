@@ -296,9 +296,11 @@ func (r *ScaledObjectReconciler) getScaledObjectMetricSpecs(ctx context.Context,
 				return nil, fmt.Errorf("metricName %s defined multiple times in ScaledObject %s", externalMetricName, scaledObject.Name)
 			}
 
-			// add the scaledobject.keda.sh/name label. This is how the MetricsAdapter will know which scaledobject a metric is for when the HPA queries it.
+			// add the scaledobject.keda.sh/uid label. This is how the MetricsAdapter will know which scaledobject a metric is for when the HPA queries it.
+			// Using UID instead of name to avoid the 63-character Kubernetes label value limit.
+			// See: https://github.com/kedacore/keda/issues/6998
 			metricSpec.External.Metric.Selector = &metav1.LabelSelector{MatchLabels: make(map[string]string)}
-			metricSpec.External.Metric.Selector.MatchLabels[kedav1alpha1.ScaledObjectOwnerAnnotation] = scaledObject.Name
+			metricSpec.External.Metric.Selector.MatchLabels[kedav1alpha1.ScaledObjectOwnerUIDAnnotation] = string(scaledObject.UID)
 			externalMetricNames = append(externalMetricNames, externalMetricName)
 		}
 	}
@@ -356,7 +358,7 @@ func (r *ScaledObjectReconciler) getScaledObjectMetricSpecs(ctx context.Context,
 					Metric: autoscalingv2.MetricIdentifier{
 						Name: compMetricName,
 						Selector: &metav1.LabelSelector{
-							MatchLabels: map[string]string{kedav1alpha1.ScaledObjectOwnerAnnotation: scaledObject.Name},
+							MatchLabels: map[string]string{kedav1alpha1.ScaledObjectOwnerUIDAnnotation: string(scaledObject.UID)},
 						},
 					},
 					Target: correctHpaTarget,

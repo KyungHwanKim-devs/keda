@@ -95,17 +95,55 @@ func (p *KedaProvider) GetExternalMetric(ctx context.Context, namespace string, 
 		logger.Info("Connection to KEDA Metrics Service gRPC server has been successfully established", "server", p.grpcClient.GetServerURL())
 	}
 
-	// selector is in form: `scaledobject.keda.sh/name: scaledobject-name`
+	// Try to get UID first (new format: scaledobject.keda.sh/uid: scaledobject-uid)
+	// Fall back to name for backward compatibility (old format: scaledobject.keda.sh/name: scaledobject-name)
+	scaledObjectUID := selector.Get(kedav1alpha1.ScaledObjectOwnerUIDAnnotation)
 	scaledObjectName := selector.Get(kedav1alpha1.ScaledObjectOwnerAnnotation)
-	if scaledObjectName == "" {
-		err := fmt.Errorf("scaledObject name is not specified")
-		logger.Error(err, fmt.Sprintf("please specify scaledObject name, it needs to be set as value of label selector %q on the query", kedav1alpha1.ScaledObjectOwnerAnnotation))
+
+	var scaledObjectIdentifier string
+	var useUID bool
+	if scaledObjectUID != "" {
+		scaledObjectIdentifier = scaledObjectUID
+		useUID = true
+	} else if scaledObjectName != "" {
+		scaledObjectIdentifier = scaledObjectName
+		useUID = false
+	} else {
+		err := fmt.Errorf("scaledObject identifier is not specified")
+		logger.Error(err, fmt.Sprintf("please specify scaledObject UID (%q) or name (%q) as value of label selector on the query",
+			kedav1alpha1.ScaledObjectOwnerUIDAnnotation, kedav1alpha1.ScaledObjectOwnerAnnotation))
 
 		return &external_metrics.ExternalMetricValueList{}, err
 	}
 
+	// Resolve UID to name if needed (gRPC client expects name)
+	if useUID {
+		scaledObjectName, err = p.resolveScaledObjectName(ctx, namespace, scaledObjectUID)
+		if err != nil {
+			logger.Error(err, "failed to resolve ScaledObject name from UID", "uid", scaledObjectUID)
+			return &external_metrics.ExternalMetricValueList{}, err
+		}
+	}
+
 	metrics, err := p.grpcClient.GetMetrics(ctx, scaledObjectName, namespace, info.Metric)
+	_ = scaledObjectIdentifier // used for logging below
 	logger.V(1).WithValues("scaledObjectName", scaledObjectName, "scaledObjectNamespace", namespace, "metrics", metrics).Info("Receiving metrics")
 
 	return metrics, err
+}
+
+// resolveScaledObjectName resolves a ScaledObject name from its UID
+func (p *KedaProvider) resolveScaledObjectName(ctx context.Context, namespace, uid string) (string, error) {
+	soList := &kedav1alpha1.ScaledObjectList{}
+	if err := p.client.List(ctx, soList, client.InNamespace(namespace)); err != nil {
+		return "", fmt.Errorf("failed to list ScaledObjects: %w", err)
+	}
+
+	for _, so := range soList.Items {
+		if string(so.UID) == uid {
+			return so.Name, nil
+		}
+	}
+
+	return "", fmt.Errorf("ScaledObject with UID %q not found in namespace %q", uid, namespace)
 }
