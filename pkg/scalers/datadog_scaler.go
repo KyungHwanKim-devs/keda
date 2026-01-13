@@ -81,6 +81,11 @@ const avgString = "average"
 
 var filter *regexp.Regexp
 
+var datadogNoDataMessageMarkers = []string{
+	"no data points found",
+	"no datapoints found",
+}
+
 func init() {
 	filter = regexp.MustCompile(`.*\{.*\}.*`)
 }
@@ -322,6 +327,16 @@ func (s *datadogScaler) getQueryResult(ctx context.Context) (float64, error) {
 			return -1, fmt.Errorf("your Datadog account reached the %s queries per %s seconds rate limit, next limit reset will happen in %s seconds", rateLimit, rateLimitPeriod, rateLimitReset)
 		}
 
+		if r.StatusCode == http.StatusUnprocessableEntity {
+			if message, ok := datadogNoDataMessage(err); ok {
+				s.logger.V(1).Info("Datadog query returned no data for the time window", "message", message)
+				if s.metadata.UseFiller {
+					return *s.metadata.FillValue, nil
+				}
+				return 0, fmt.Errorf("no Datadog metrics returned for the given time window")
+			}
+		}
+
 		if r.StatusCode != 200 {
 			if err != nil {
 				return -1, fmt.Errorf("error when retrieving Datadog metrics: %w", err)
@@ -407,6 +422,111 @@ func (s *datadogScaler) getQueryResult(ctx context.Context) (float64, error) {
 	}
 }
 
+// Datadog can return 422 responses for empty time windows; treat matched messages as no data.
+func datadogNoDataMessage(err error) (string, bool) {
+	messages := datadogErrorMessages(err)
+	return findDatadogNoDataMessage(messages)
+}
+
+func findDatadogNoDataMessage(messages []string) (string, bool) {
+	if len(messages) == 0 {
+		return "", false
+	}
+
+	var matched string
+	for _, message := range messages {
+		if isDatadogNoDataMessage(message) {
+			if matched == "" {
+				matched = message
+			}
+			continue
+		}
+		return "", false
+	}
+
+	return matched, matched != ""
+}
+
+func datadogErrorMessages(err error) []string {
+	if err == nil {
+		return nil
+	}
+
+	var apiErr datadog.GenericOpenAPIError
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+
+	return datadogErrorMessagesFromBody(apiErr.Body())
+}
+
+func datadogErrorMessagesFromBody(body []byte) []string {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return nil
+	}
+
+	var allMessages []string
+	result := gjson.ParseBytes(body)
+
+	if errors := result.Get("errors"); errors.Exists() {
+		allMessages = append(allMessages, getMessagesFromResult(errors)...)
+	}
+	if err := result.Get("error"); err.Exists() && err.Type == gjson.String {
+		allMessages = append(allMessages, err.String())
+	}
+	if msg := result.Get("message"); msg.Exists() && msg.Type == gjson.String {
+		allMessages = append(allMessages, msg.String())
+	}
+
+	return dedupAndTrimMessages(allMessages)
+}
+
+func getMessagesFromResult(result gjson.Result) []string {
+	if result.Type == gjson.String {
+		return []string{result.String()}
+	}
+	var messages []string
+	for _, entry := range result.Array() {
+		if entry.Type == gjson.String {
+			messages = append(messages, entry.String())
+		}
+	}
+	return messages
+}
+
+func dedupAndTrimMessages(messages []string) []string {
+	if len(messages) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(messages))
+	result := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		trimmed := strings.TrimSpace(msg)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		result = append(result, trimmed)
+	}
+	return result
+}
+
+func isDatadogNoDataMessage(message string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(message))
+	if normalized == "" {
+		return false
+	}
+	for _, marker := range datadogNoDataMessageMarkers {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *datadogScaler) getDatadogMetricValue(req *http.Request) (float64, error) {
 	resp, err := s.httpClient.Do(req)
 
@@ -418,6 +538,17 @@ func (s *datadogScaler) getDatadogMetricValue(req *http.Request) (float64, error
 	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnprocessableEntity {
+			messages := datadogErrorMessagesFromBody(body)
+			if message, ok := findDatadogNoDataMessage(messages); ok {
+				s.logger.V(1).Info("Datadog metric value request returned no data", "message", message)
+				if s.metadata.UseFiller {
+					return *s.metadata.FillValue, nil
+				}
+				return 0, fmt.Errorf("no Datadog metrics returned for the given time window")
+			}
+		}
+
 		r := gjson.GetBytes(body, "message")
 		if r.Type == gjson.String {
 			return 0, fmt.Errorf("error getting metric value: %s", r.String())
